@@ -1,0 +1,189 @@
+;; docs/identity-claims.edn — この repo が名乗る identity claim と、その **実測**。
+;;
+;; なぜ EDN で持つか: README に散文で「A は解決するが B はしない」と書くと、
+;; 直った瞬間・悪化した瞬間の両方で README が黙って嘘になる。ここに測定値を
+;; 固定して test に突き合わせさせると、**どちらに動いても赤くなる**
+;; （直ったら「doc を更新せよ」と言って落ちる）。
+;;
+;; 手編集してよい唯一のタイミングは「実際に測り直して、記述も直したとき」。
+;;
+;; :measured の :http は curl の HTTP status。0 は「接続そのものが失敗」
+;; （DNS 不在・TLS 不成立）であって 0 件・空応答ではない。
+;;
+;; 兄弟 repo `cloud-itonami/cargo` / `cloud-itonami/handotai-actor` の同名ファイルと
+;; 同じ形にしてある。**ただし測定値は repo ごとに違う** —— cargo は「commit した
+;; did.json の id が解決しない」形だが、この repo は逆に「id は解決するが、
+;; 解決先の中身が commit したものと違う」形である（下記 :did/committed）。
+
+{:measured-at "2026-08-08"
+ :measured-how "curl -sL --max-time 15 -o /dev/null -w '%{http_code}'"
+
+ ;; ── identity ──────────────────────────────────────────────────────────────
+ ;; この actor は 3 つの名前で名乗られている。**解決するのは 1 つだけ**で、
+ ;; それは .well-known/did.json が名乗っているものである（cargo と違い、
+ ;; ここは commit 側が正しい名前を持っている）。
+ :claims
+ [{:id          :did/manifest
+   :source      "actor-manifest.jsonld → @id"
+   :did         "did:web:jp-ashiba.etzhayyim.com"
+   ;; did:web 解決規則（W3C did:web）: method-specific id の ':' を '/' にして
+   ;; https:// を付ける。path 成分が無い場合だけ /.well-known/ を挟む。
+   :resolves-to "https://jp-ashiba.etzhayyim.com/.well-known/did.json"
+   :measured    {:http 0}
+   :note        "ホストが存在しない。actor ごとのサブドメインを配る設計だった名残で、
+                 実際に配られたのは did:web:etzhayyim.com:actor:<name> の方だった。"}
+
+  {:id          :did/substrate
+   :source      "src/jp_ashiba/murakumo.cljc → actor-did"
+   :did         "did:web:jp-ashiba.etzhayyim.com"
+   :resolves-to "https://jp-ashiba.etzhayyim.com/.well-known/did.json"
+   :measured    {:http 0}
+   :note        "**gate が発行する全 effect の :actor がこの値である。**
+                 manifest の @id とは一致し、解決する DID とは一致しない。
+                 つまり実際に emit される record は、解決しない DID に帰属している。"}
+
+  {:id          :did/committed
+   :source      ".well-known/did.json → id"
+   :did         "did:web:etzhayyim.com:actor:jp-ashiba"
+   :resolves-to "https://etzhayyim.com/actor/jp-ashiba/did.json"
+   :measured    {:http 200 :serves-committed-bytes? false}
+   :note        "**id は解決する。しかし解決先は、この repo が commit した document ではない。**
+                 生きている側（etzhayyim.com が発行）と commit 側の差:
+                   - service#atproto_pds: live=https://pds.aozora.app（200）
+                     / commit=https://pds.etzhayyim.com（530）
+                   - alsoKnownAs: live=[] / commit=4 件
+                   - @context の suite: live=jws-2020 / commit=ed25519-2020
+                   - live にだけ #xrpc-libp2p service と _meta がある
+                 commit 側は**死んだ endpoint を指している**ので、この document を
+                 信じた resolver は到達できない PDS に行く。
+                 **どちらを正とするかはこの repo が決められない**（live document を
+                 発行しているのは etzhayyim.com 側）。ここでは測定値の固定に留める。"}
+
+  {:id          :aka/at-handle
+   :source      ".well-known/did.json → alsoKnownAs[0]"
+   :did         "at://jp-ashiba.etzhayyim.com"
+   :resolves-to "https://jp-ashiba.etzhayyim.com/.well-known/atproto-did"
+   :measured    {:http 0}
+   :note        "AT Protocol handle。:did/manifest と同じホストを指しており、同じく不在。"}
+
+  {:id          :aka/old-pages
+   :source      ".well-known/did.json → alsoKnownAs[3]"
+   :did         "did:web:etzhayyim.github.io:com-etzhayyim-jp-ashiba"
+   :resolves-to "https://etzhayyim.github.io/com-etzhayyim-jp-ashiba/did.json"
+   :measured    {:http 404}
+   :note        "etzhayyim 時代の GitHub Pages。repo は cloud-itonami/jp-ashiba-actor へ
+                 移っており、旧 org の Pages はもう無い。"}]
+
+ ;; ── 配信面 ────────────────────────────────────────────────────────────────
+ :surfaces
+ [{:id       :surface/github-pages
+   :url      "https://cloud-itonami.github.io/jp-ashiba-actor/.well-known/did.json"
+   :measured {:http 404 :pages-enabled? false}
+   :note     "**この repo では Pages が有効になっていない**（GET /repos/…/pages が 404）。
+              兄弟の cargo は有効（200）で committed bytes を実際に配信している。
+              つまり .nojekyll は cargo では現役だが、ここでは名残である。
+              commit した did.json はどこにも publish されていない。"}
+
+  {:id       :context/actor-v1
+   :url      "https://etzhayyim.com/ns/actor/v1"
+   :measured {:http 404}
+   :note     "actor-manifest.jsonld の @context。未公開なので、この文書は JSON-LD として
+              展開できない —— 実質ただの JSON である。cargo / handotai-actor でも同じ 404。"}
+
+  {:id       :pds/committed
+   :url      "https://pds.etzhayyim.com/xrpc/_health"
+   :measured {:http 530}
+   :note     "commit されている did.json の service endpoint。Cloudflare 1033（tunnel 不在）。"}
+
+  {:id       :pds/live
+   :url      "https://pds.aozora.app/xrpc/_health"
+   :measured {:http 200}
+   :note     "解決する DID document が実際に指している endpoint。生きている。"}]
+
+ ;; ── lexicon が 3 つに割れている ───────────────────────────────────────────
+ ;; **この repo で最も重い実測。** gate（src）が record を書き込む先の collection と、
+ ;; descriptor（manifest）が宣言する collection は **1 つも一致しない**。
+ ;;
+ ;; 権威は live DID document の _meta.primaryLexicon で、そこには
+ ;; "com.etzhayyim.jp-ashiba" とある —— **prefix については substrate が正しく、
+ ;; manifest がずれている。** ただし substrate は suffix を小文字化しているので、
+ ;; prefix を揃えても manifest の camelCase とは一致しない。
+ :lexicon
+ {:authority-primary-lexicon "com.etzhayyim.jp-ashiba"
+  :authority-source "https://etzhayyim.com/actor/jp-ashiba/did.json → _meta.primaryLexicon"
+  :substrate-prefix "com.etzhayyim.jp-ashiba."
+  :manifest-prefixes ["com.etzhayyim.apps.jpAshiba." "com.etzhayyim.apps.jpashiba."]
+  ;; manifest 自身の中で actor 名の casing が 2 通りある。xrpc nsid の
+  ;; coverage.get だけが小文字。
+  :manifest-nsid-casings ["jpAshiba" "jpashiba"]
+  :substrate-collection-count 13
+  :manifest-collection-count 5
+  ;; 交差 0。gate が書く先を、descriptor 側の誰も購読していない。
+  :shared-collection-count 0}
+
+ ;; ── descriptor の国勢調査 ─────────────────────────────────────────────────
+ ;; 不変条件ではなく測定値。増えても減っても赤くする。
+ ;;
+ ;; count を不変条件として書かない理由: 兄弟 repo cargo に置かれていた
+ ;; `actor-manifest.test.ts` は `toHaveLength(8)` と書いたまま 2 年以上走らず、
+ ;; その間に実際は 10 本に増えていた。**走らないテストは、自分が古くなった
+ ;; ことも報告しない。** ここは両方向に落ちる。
+ :census
+ {:pipeline-count 8
+  :pipelines-by-trigger {"cron" 2, "subscribeRepos" 2, "xrpc" 4}
+  :step-count 22
+  :actor-count 5
+  :capability-count 4
+  :xrpc-nsid-count 4
+  ;; 宣言されているのに、どの step も呼ばない capability。ここは 0 件（cargo と違う）。
+  :unexercised-capabilities []
+  ;; triggers.subscribeRepos が宣言しているのに、どの pipeline も購読しない collection。
+  :declared-but-unsubscribed-collections
+  ["com.etzhayyim.apps.jpAshiba.subscriptionPlan"]}
+
+ ;; ── gate の国勢調査 ───────────────────────────────────────────────────────
+ :gate
+ {:cell-count 13
+  :common-gate-count 7
+  :effects-per-ready-cell 1
+  :murakumo-nodes ["reuben"]}
+
+ ;; ── 既知の欠陥（測って固定しただけ。直っていない）─────────────────────────
+ ;; ここは「正しい」と主張する節ではない。**現状こうである**という測定で、
+ ;; 直したら赤くなる。直すときは test の該当 deftest ごと書き換えること。
+ :gaps
+ [{:id :rkey/reserved-not-guarded
+   :where "src/jp_ashiba/murakumo.cljc → safe-rkey"
+   :measured {"." "." ".." ".." "did:web:.." ".."}
+   :note "AT Protocol は record key として `.` と `..` を予約しており、この 2 つは
+          rkey として不正である。safe-rkey は不正文字を `-` に潰すが、`.` は
+          安全文字集合 [A-Za-z0-9._~-] に含まれるため素通りする。結果として
+          入力が `..`（あるいは `did:web:..`）のとき、予約語そのものが rkey になる。
+          **未修正。** 実際に到達するには request-id / rkey にそれを渡す呼び出しが
+          要り、この repo にはまだ呼び出し側が無い（gate は scaffold）。
+          修正するときは blank 判定と同じ場所で弾くのが素直。"}
+
+  {:id :effects/attributed-to-unresolvable-did
+   :where "src/jp_ashiba/murakumo.cljc → actor-did"
+   :measured {:did "did:web:jp-ashiba.etzhayyim.com" :http 0}
+   :note "gate が発行する effect の :actor と record の :actorDid は、解決しない
+          DID を名乗る（:did/substrate 参照）。解決する DID は
+          did:web:etzhayyim.com:actor:jp-ashiba。**未修正** —— どちらを正とするかは
+          live document を発行する etzhayyim.com 側の判断で、この repo が決められない。"}]
+
+ ;; ── repo 内で解決しない参照 ───────────────────────────────────────────────
+ ;; network を要らない検査。
+ :dangling-references
+ [{:from "actor-manifest.jsonld → complianceDocs[0]"
+   :refers-to "90-docs/rules/compliance/per-did-kyumei-shinka-autonomy.md"
+   :exists? false
+   :note "etzhayyim monorepo 内のパス。この repo に 90-docs/ は無い。"}
+  {:from "actor-manifest.jsonld → complianceDocs[1]"
+   :refers-to "90-docs/platform/260403-live-data-kyumei-shinka-consolidated.md"
+   :exists? false}
+  {:from "NOTICE"
+   :refers-to "CHARTER-RIDER.md"
+   :exists? false
+   :note "NOTICE が Rider 本文を 'see CHARTER-RIDER.md' と指すが repo に無い。
+          LICENSE ファイルも無い（NOTICE は Apache-2.0 + Rider を主張している）。
+          cargo / handotai-actor と同じ欠落。"}]}

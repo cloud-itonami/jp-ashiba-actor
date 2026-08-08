@@ -1,0 +1,265 @@
+(ns jp_ashiba.repo-test
+  "**この repo に実際に commit されているファイル**と、docs/identity-claims.edn に
+   固定した測定値を突き合わせる。
+
+   gate-test が『規則が落ちること』を fixture で見せるのに対し、こちらは
+   『実物がその測定値のままか』を見る。network は要らない —— network を要る
+   検査は network-test にある。
+
+   ここの deftest は原則 **両方向に落ちる**。悪化したときだけでなく、
+   直ったときにも赤くなって『測り直して claims を更新しろ』と言う。"
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [cljs.reader :as reader]
+            [jp_ashiba.didweb :as didweb]
+            [jp_ashiba.murakumo :as m]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+(def repo-root (.cwd js/process))
+
+(defn- slurp* [rel] (.readFileSync fs (path/join repo-root rel) "utf8"))
+(defn- json* [rel] (js->clj (js/JSON.parse (slurp* rel))))
+(defn- exists? [rel] (.existsSync fs (path/join repo-root rel)))
+
+(def manifest (json* "actor-manifest.jsonld"))
+(def did-doc (json* ".well-known/did.json"))
+(def claims (reader/read-string (slurp* "docs/identity-claims.edn")))
+
+(defn- claim [id] (first (filter #(= id (:id %)) (:claims claims))))
+
+;; ── manifest の国勢調査 ─────────────────────────────────────────────────────
+
+(defn- pipelines [] (vec (get manifest "pipelines")))
+(defn- all-steps []
+  (vec (mapcat (fn [i p] (map (fn [s] [i s]) (get p "steps"))) (range) (pipelines))))
+(defn- xrpc-nsids []
+  (vec (keep #(when (= "xrpc" (get-in % ["trigger" "type"])) (get-in % ["trigger" "nsid"]))
+             (pipelines))))
+(defn- subscribed-collections []
+  (into #{} (mapcat #(when (= "subscribeRepos" (get-in % ["trigger" "type"]))
+                       (get-in % ["trigger" "collections"]))
+                    (pipelines))))
+
+(defn- census []
+  (let [ps (pipelines)
+        used (into #{} (map (fn [[_ s]] (get s "fn")) (all-steps)))
+        subbed (subscribed-collections)]
+    {:pipeline-count (count ps)
+     :pipelines-by-trigger (frequencies (map #(get-in % ["trigger" "type"]) ps))
+     :step-count (count (all-steps))
+     :actor-count (count (get manifest "actors"))
+     :capability-count (count (get manifest "capabilities"))
+     :xrpc-nsid-count (count (xrpc-nsids))
+     :unexercised-capabilities (vec (remove used (get manifest "capabilities")))
+     :declared-but-unsubscribed-collections
+     (vec (remove subbed (get-in manifest ["triggers" "subscribeRepos" "collections"])))}))
+
+(deftest the-pinned-census-matches-the-manifest
+  "**兄弟 repo cargo が 2 年以上見逃した種類の drift をここで止める。**
+   そこに置かれていた actor-manifest.test.ts は `toHaveLength(8)` と書いたまま
+   一度も走らず、実際の pipeline は 10 本に増えていた。走らないテストは、
+   自分が古くなったことも報告しない。
+
+   増えても減っても赤くなる。赤くなったら『manifest を戻せ』ではなく
+   『identity-claims.edn を測り直して更新しろ』という意味。"
+  (is (= (:census claims) (census))))
+
+;; ── descriptor 自身の不変条件 ───────────────────────────────────────────────
+
+(deftest every-step-declares-a-capability-the-manifest-grants
+  "step が呼ぶ fn は capabilities に宣言されていなければならない（過小宣言）。
+   deny-by-default の workspace で、宣言を読んで権限を絞る実装の前提が崩れる。"
+  (let [caps (set (get manifest "capabilities"))]
+    (doseq [[i s] (all-steps)]
+      (testing (str "pipeline " i " / step " (get s "id"))
+        (is (contains? caps (get s "fn"))
+            (str "未宣言の fn: " (get s "fn")))))))
+
+(deftest no-step-uses-the-custom-escape-hatch
+  "fn \"custom\" は任意コードへの逃げ道。1 つ通ると『この descriptor は宣言だけで
+   閉じている』という主張がそこで終わる。"
+  (doseq [[i s] (all-steps)]
+    (is (not= "custom" (get s "fn")) (str "pipeline " i " が custom を使う"))))
+
+(deftest every-step-has-an-id-an-fn-and-args
+  "どれかが欠けた step は、host が実行時に初めて落ちる。"
+  (doseq [[i s] (all-steps)
+          k ["id" "fn" "args"]]
+    (is (some? (get s k)) (str "pipeline " i " の step に " k " が無い: " (pr-str s)))))
+
+(deftest every-cron-trigger-has-five-fields
+  "3 フィールドや 6 フィールドの cron は、host によって黙って別の時刻に走る
+   （秒付き 6 フィールドと取り違える）。"
+  (doseq [p (pipelines)
+          :when (= "cron" (get-in p ["trigger" "type"]))
+          :let [c (get-in p ["trigger" "cron"])]]
+    (is (= 5 (count (str/split (str/trim (str c)) #"\s+")))
+        (str "cron \"" c "\" が 5 フィールドでない"))))
+
+(deftest no-xrpc-nsid-is-declared-twice
+  "同じ nsid が 2 本あると後勝ちになり、片方が黙って到達不能になる。
+   pipeline は消えていないので一覧を見ても気づけない。"
+  (doseq [[nsid n] (frequencies (xrpc-nsids))]
+    (is (= 1 n) (str "nsid \"" nsid "\" が " n " 本の pipeline にある"))))
+
+(deftest every-subscribed-collection-is-also-declared-up-front
+  "pipeline が実際に購読する collection が、冒頭の triggers 宣言に無いと、
+   宣言だけを読む host はその購読を設定しない。
+   （逆向き＝宣言だけして購読しないものは census が pin する。）"
+  (let [declared (set (get-in manifest ["triggers" "subscribeRepos" "collections"]))]
+    (doseq [c (subscribed-collections)]
+      (is (contains? declared c)
+          (str "購読する \"" c "\" が triggers.subscribeRepos.collections に無い")))))
+
+(deftest every-did-document-service-id-is-a-fragment-of-its-own-did
+  "service id が別の DID を指したまま残るのは、改名を半分だけやった形そのもの。
+   document 全体は妥当に見えるので、id を突き合わせない限り通る。"
+  (let [id (get did-doc "id")]
+    (doseq [s (get did-doc "service")]
+      (is (str/starts-with? (str (get s "id")) (str id "#"))
+          (str "service id \"" (get s "id") "\" が \"" id "#\" で始まらない")))))
+
+(deftest every-also-known-as-entry-is-an-absolute-uri
+  "相対だと解決できない。"
+  (doseq [aka (get did-doc "alsoKnownAs")]
+    (is (re-find #"^[a-zA-Z][a-zA-Z0-9+.-]*:" (str aka))
+        (str "alsoKnownAs \"" aka "\" が絶対 URI でない"))))
+
+;; ── identity ────────────────────────────────────────────────────────────────
+
+(deftest every-identity-claim-names-the-value-its-source-file-actually-holds
+  "claims の :did が、その :source が指すファイルの実際の値であること。
+   claims 側だけを直して descriptor を直し忘れる（あるいは逆）を止める。"
+  (testing ":did/manifest は actor-manifest.jsonld の @id"
+    (is (= (:did (claim :did/manifest)) (get manifest "@id"))))
+  (testing ":did/substrate は murakumo.cljc の actor-did"
+    (is (= (:did (claim :did/substrate)) m/actor-did)))
+  (testing ":did/committed は .well-known/did.json の id"
+    (is (= (:did (claim :did/committed)) (get did-doc "id"))))
+  (testing ":aka/at-handle は did.json の alsoKnownAs の 1 件目"
+    (is (= (:did (claim :aka/at-handle)) (first (get did-doc "alsoKnownAs")))))
+  (testing ":aka/old-pages は did.json の alsoKnownAs の 4 件目"
+    (is (= (:did (claim :aka/old-pages)) (nth (get did-doc "alsoKnownAs") 3)))))
+
+(deftest the-substrate-and-the-manifest-agree-on-the-actor-did
+  "gate が effect に載せる :actor と、descriptor が名乗る @id が一致すること。
+   ここが割れると『descriptor は A を名乗り、実際に書かれる record は B に帰属する』
+   になり、どちらを読んでも他方が見えない。"
+  (is (= (get manifest "@id") m/actor-did)))
+
+(deftest the-did-document-names-a-different-did-than-the-manifest
+  "**既知の割れ**（docs/identity-claims.edn 参照）。manifest / substrate は
+   did:web:jp-ashiba.etzhayyim.com を名乗り、commit された did.json は
+   did:web:etzhayyim.com:actor:jp-ashiba を名乗る。解決するのは後者だけ。
+
+   これは『正しい』の固定ではなく測定値の固定である。**揃ったら赤くなり**、
+   claims を測り直せという意味になる。"
+  (is (not= (get manifest "@id") (get did-doc "id"))))
+
+(deftest the-claims-file-derives-each-resolution-url-from-its-own-did
+  "`:resolves-to` を手で書かせない。手書きの URL は、did:web の解決規則を
+   1 箇所間違えただけで『存在しない URL を測って 404 だと報告する』——
+   測定は動いているように見えるので、間違いに気づく手がかりが無い。"
+  (doseq [c (:claims claims)]
+    (testing (str (:id c))
+      (is (= (:resolves-to c) (didweb/resolution-url (:did c)))))))
+
+(deftest no-claim-uses-a-percent-encoded-host
+  "didweb/did->document-url は host のポート percent-encoding を扱わない
+   （その旨 docstring に明記してある）。扱わない前提が破れたら落とす ——
+   素通しにすると、間違った URL を測って正常に見える。"
+  (doseq [c (:claims claims)]
+    (is (not (str/includes? (:did c) "%"))
+        (str (:id c) " が percent-encoding を含む。didweb を拡張すること"))))
+
+;; ── lexicon の三つ割れ ──────────────────────────────────────────────────────
+
+(deftest the-substrate-and-the-manifest-share-no-collection-at-all
+  "**この repo で最も重い測定。** gate が record を書き込む先の collection と、
+   manifest が宣言する collection の交差が 0 件であること。
+
+   gate は com.etzhayyim.jp-ashiba.* に書き、manifest は
+   com.etzhayyim.apps.jpAshiba.* を宣言する。片方を読んで他方を想像すると必ず外れる。
+
+   **これも測定値であって正しさではない。** 揃えたら赤くなり、
+   claims の :lexicon を測り直せという意味になる。"
+  (let [substrate (into #{} (mapcat :collections (vals m/cell-specs)))
+        declared (into #{} (concat (get-in manifest ["triggers" "subscribeRepos" "collections"])
+                                   (get manifest "requiredCollections")
+                                   (mapcat #(get-in % ["trigger" "collections"]) (pipelines))))
+        lex (:lexicon claims)]
+    (is (= (:substrate-collection-count lex) (count substrate)))
+    (is (= (:manifest-collection-count lex) (count declared)))
+    (is (= (:shared-collection-count lex) (count (filter declared substrate))))))
+
+(deftest the-substrate-prefix-is-the-one-the-live-authority-declares
+  "live DID document の _meta.primaryLexicon（= 権威）と substrate の prefix が
+   一致していること。**prefix については manifest ではなく substrate が正しい。**
+   substrate 側を manifest に合わせて『直す』と、権威から離れる。"
+  (let [lex (:lexicon claims)]
+    (is (= (str (:authority-primary-lexicon lex) ".") (:substrate-prefix lex)))
+    (doseq [c (mapcat :collections (vals m/cell-specs))]
+      (is (str/starts-with? c (:substrate-prefix lex))
+          (str "substrate の collection が prefix から外れた: " c)))))
+
+(deftest the-manifest-still-spells-the-actor-name-two-different-ways
+  "manifest 内の xrpc nsid が jpAshiba と jpashiba の 2 通りで actor 名を綴る
+   （coverage.get だけ小文字）。lexicon 解決は大小を区別するので、片方は
+   別 namespace である。**既知。揃えたら赤くなる。**"
+  (let [casings (into (sorted-set)
+                      (keep #(second (re-find #"^com\.etzhayyim\.apps\.([^.]+)\." %))
+                            (xrpc-nsids)))]
+    (is (= (vec (:manifest-nsid-casings (:lexicon claims))) (vec casings)))))
+
+;; ── gate の国勢調査 ─────────────────────────────────────────────────────────
+
+(deftest the-pinned-gate-census-matches-the-substrate
+  "cell や baseline gate の数が動いたら、claims を測り直させる。
+   とくに :common-gate-count が**減る**のは gate が緩む方向の変更なので、
+   気づかずに通ってはいけない。"
+  (let [g (:gate claims)]
+    (is (= (:cell-count g) (count m/cell-specs)))
+    (is (= (:common-gate-count g) (count m/common-gates)))
+    (is (= (:murakumo-nodes g) (vec (sort (distinct (map :murakumo-node (vals m/cell-specs)))))))
+    (is (= (:effects-per-ready-cell g)
+           (count (:effects (m/cell-plan :rentalcontract
+                                         {:attestations (into #{} m/common-gates)})))))))
+
+;; ── repo 内の参照 ───────────────────────────────────────────────────────────
+
+(deftest the-dangling-references-recorded-are-still-dangling
+  "`:exists? false` と記録した参照が、今も本当に repo に無いこと。
+   誰かが CHARTER-RIDER.md を足したら赤くなり、claims を直せと言う。"
+  (doseq [r (:dangling-references claims)]
+    (testing (:refers-to r)
+      (is (= (:exists? r) (exists? (:refers-to r)))))))
+
+(deftest the-compliance-docs-the-manifest-points-at-are-the-ones-recorded
+  "manifest の complianceDocs が増減したら、dangling の記録も測り直す。
+   記録側だけが古くなるのを止める。"
+  (is (= (set (filter #(str/starts-with? % "90-docs/") (get manifest "complianceDocs")))
+         (set (keep #(when (str/starts-with? (:refers-to %) "90-docs/") (:refers-to %))
+                    (:dangling-references claims))))))
+
+;; ── 走らないテストを置かない ────────────────────────────────────────────────
+
+(deftest no-test-file-sits-here-without-a-runner
+  "兄弟 repo cargo には vitest を import する actor-manifest.test.ts が置かれて
+   いたが、package.json も node_modules も無く **一度も実行できなかった**。
+   走らないテスト file は、緑にも赤にもならないぶん無いより悪い ——
+   『テストがある』という外見だけが残る。
+
+   workspace の規則（superproject CLAUDE.md）でも新規 .ts / .mjs / .sh は禁止で、
+   script host は nbb に一本化されている。"
+  (let [walk (fn walk [dir]
+               (mapcat (fn [e]
+                         (let [p (path/join dir e)]
+                           (cond
+                             (= e ".git") []
+                             (.isDirectory (.statSync fs p)) (walk p)
+                             :else [p])))
+                       (vec (.readdirSync fs dir))))
+        offenders (filter #(re-find #"\.(ts|mjs|cjs|sh)$" %) (walk repo-root))]
+    (is (= [] (vec offenders))
+        (str "runner の無い / 禁止された script が居る: " (str/join ", " offenders)))))

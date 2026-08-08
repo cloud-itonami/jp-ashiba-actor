@@ -1,0 +1,191 @@
+(ns jp_ashiba.gate-test
+  "`src/jp_ashiba/murakumo.cljc` の **deny-by-default gate** を固定する。
+
+   この repo で唯一 substrate と呼べるのはこの gate で、`cell-plan` は
+   『required-gates が全て attest されていなければ `:status :blocked` にして
+   effect を 1 つも出さない』という判断を持つ。**それが緩む方向に壊れると、
+   attest されていない actor が record を書けるようになる。**
+
+   にもかかわらず、この repo には 2026-07-18 の rescue commit で murakumo.cljc が
+   入ってから **テストが 1 本も無かった**。gate が緩んでも誰も気づかない状態が
+   既定だった。
+
+   ## この suite が守っているのは 2 種類
+
+   1. **安全側**（緩むと危ない）: 未 attest で ready にならない / 明示 false を
+      attest とみなさない / blocked のとき effect が空 / effect が他 actor に
+      帰属しない。壊れたら「権限のない書き込みが通る」。
+   2. **生存側**（きつくなると気づけない）: attestation を set でも
+      keyword map でも string map でも受ける。壊れたら**全部 blocked になる**ので
+      安全ではあるが、actor が黙って何もしなくなる。
+
+   どちらも壊れ方が静かなので、fixture で撃って赤くなることを確かめてある
+   （`scripts/maturity-loop/mutations.edn` の :jp-ashiba/*）。"
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [jp_ashiba.murakumo :as m]))
+
+(def all-attested
+  "common-gates を全て満たす attestation（set 形）。"
+  (into #{} m/common-gates))
+
+(def a-cell
+  "代表として撃つ cell。cell ごとの差は :collections と :legacy-cell だけなので、
+   個別 cell の検査は『全 cell を回す』deftest 側で担保する。"
+  :rentalcontract)
+
+;; ── 安全側 ──────────────────────────────────────────────────────────────────
+
+(deftest every-cell-is-blocked-when-nothing-is-attested
+  "**gate の一番外側。** 13 cell のうち 1 つでも無 attest で ready になったら、
+   そこが素通り口になる。cell は manifest から機械生成された表なので、
+   将来 cell が増えたときに required-gates を書き忘れる形で緩みうる ——
+   だから代表 1 件ではなく全件を回す。"
+  (doseq [cell (keys m/cell-specs)]
+    (testing (str cell)
+      (let [plan (m/cell-plan cell {:attestations {}})]
+        (is (= :blocked (:status plan)))
+        (is (= [] (:effects plan)) "blocked なのに effect が出ている")))))
+
+(deftest every-cell-requires-at-least-the-common-baseline
+  "cell を『gate 無し』で足せないこと。:required-gates が空の cell は
+   missing-gates が空になるので **無 attest でも :ready になる** ——
+   前の deftest はそれを結果として捕まえるが、ここは原因を名指しで止める。"
+  (doseq [[cell spec] m/cell-specs]
+    (testing (str cell)
+      (let [missing (remove (set (:required-gates spec)) m/common-gates)]
+        (is (= [] (vec missing))
+            (str cell " が baseline gate を要求していない: " (vec missing)))))))
+
+(deftest removing-any-single-required-gate-blocks-the-plan
+  "7 本の gate は **AND** であって、多数決でも代表でもない。1 本だけ落ちた
+   ときに通ってしまう実装（例: `some` と `every?` の取り違え）をここで止める。"
+  (doseq [gate m/common-gates]
+    (testing (str "missing " gate)
+      (let [plan (m/cell-plan a-cell {:attestations (disj all-attested gate)})]
+        (is (= :blocked (:status plan)))
+        (is (= [gate] (:missing-gates plan)))
+        (is (= [] (:effects plan)))))))
+
+(deftest an-attestation-that-is-explicitly-false-does-not-count-as-attested
+  "**この suite で一番静かな壊れ方。** `(contains? attestations gate)` で
+   実装すると `{:no-probing-baseline false}` が『attest 済み』になる ——
+   `false` は『測ったうえで満たしていない』という最も強い否定なのに、
+   キーがあるというだけで通る。gate-value は値を見るので落ちる。ここを固定する。"
+  (let [att (into {} (map (fn [g] [g (not= g :no-probing-baseline)]) m/common-gates))
+        plan (m/cell-plan a-cell {:attestations att})]
+    (is (= :blocked (:status plan)))
+    (is (= [:no-probing-baseline] (:missing-gates plan)))
+    (is (= [] (:effects plan)))))
+
+(deftest a-missing-attestation-map-is-treated-as-nothing-attested
+  "attestations を渡し忘れた呼び出しが『gate なし』ではなく『全部未 attest』に
+   なること。nil を空 map と同じに扱えず例外になる実装も、素通りする実装も、
+   どちらもここで落ちる。"
+  (doseq [input [{} {:attestations nil} {:attestations #{}}]]
+    (testing (pr-str input)
+      (let [plan (m/cell-plan a-cell input)]
+        (is (= :blocked (:status plan)))
+        (is (= (count m/common-gates) (count (:missing-gates plan))))))))
+
+(deftest a-blocked-plan-carries-no-records-at-all
+  "blocked のとき :effects が空なだけでなく、:records ごと存在しないこと。
+   『plan は作るが実行しない』形にすると、record が計算済みで手前に置かれる ——
+   後から effects だけ見て安心する呼び出し側が、records を拾って書ける。"
+  (let [plan (m/cell-plan a-cell {:attestations {} :request-id "r"})]
+    (is (= [] (:effects plan)))
+    (is (nil? (:records plan)))
+    (is (not (contains? plan :records)))))
+
+(deftest every-emitted-effect-is-attributed-to-this-actor
+  "effect の :actor が actor-did 以外になりうると、この gate を通した書き込みが
+   別 actor の repo に入る。record 側の :actorDid も同じ値であること。
+
+   なお actor-did 自体は**解決しない DID** である（docs/identity-claims.edn の
+   :did/substrate）。ここで固定しているのは『一貫して自分を名乗る』ことであって
+   『その名前が正しい』ことではない —— 後者は repo-test 側が測定値として持つ。"
+  (let [plan (m/cell-plan a-cell {:attestations all-attested :request-id "r" :computed-at "2026-08-08"})]
+    (is (= :ready (:status plan)))
+    (is (seq (:effects plan)))
+    (doseq [e (:effects plan)]
+      (is (= m/actor-did (:actor e)))
+      (is (= m/actor-did (:actorDid (:record e)))))))
+
+;; ── 生存側 ──────────────────────────────────────────────────────────────────
+
+(deftest a-fully-attested-cell-is-ready-and-emits-one-put-per-collection
+  "gate が通ったときに**実際に効果が出る**こと。安全側だけを固定すると
+   『常に blocked』が満点の実装になってしまう。"
+  (let [plan (m/cell-plan a-cell {:attestations all-attested :request-id "r-1" :computed-at "2026-08-08"})
+        spec (get m/cell-specs a-cell)]
+    (is (= :ready (:status plan)))
+    (is (= [] (:missing-gates plan)))
+    (is (= (count (:collections spec)) (count (:effects plan))))
+    (doseq [e (:effects plan)]
+      (is (= :mst/put-record (:op e)))
+      (is (= #{:op :actor :collection :rkey :record} (set (keys e))))
+      ;; $type は書き込み先 collection と一致していなければ、appview 側で
+      ;; 別 lexicon の record として解釈される。
+      (is (= (:collection e) (:$type (:record e)))))))
+
+(deftest attestations-are-accepted-as-a-set-a-keyword-map-or-a-string-map
+  "呼び出し側が 3 通りの形で attestation を渡してくる（set / keyword map /
+   string map）。どれか 1 つでも受け付けなくなると、その呼び出し側は
+   **例外ではなく blocked** になる —— 安全側に倒れるぶん、誰も気づかないまま
+   actor が黙る。"
+  (doseq [[label att] [["set" all-attested]
+                       ["keyword map" (into {} (map (fn [g] [g true]) m/common-gates))]
+                       ["string map" (into {} (map (fn [g] [(name g) true]) m/common-gates))]]]
+    (testing label
+      (is (= :ready (:status (m/cell-plan a-cell {:attestations att})))))))
+
+(deftest an-unknown-cell-throws-instead-of-planning-nothing
+  "打ち間違えた cell 名が nil spec のまま進むと、required-gates が nil ＝
+   missing 無し ＝ **:ready** になる。`:collections` も nil なので effect は 0 件
+   だが、status だけ見ている呼び出し側には『gate を通った』と見える。"
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (m/cell-plan :no-such-cell {:attestations all-attested}))))
+
+;; ── rkey ────────────────────────────────────────────────────────────────────
+
+(deftest safe-rkey-strips-the-did-prefix-and-replaces-unsafe-characters
+  "rkey は record のアドレスになる。`/` が残れば path として解釈されうるし、
+   AT Protocol の rkey 構文 [A-Za-z0-9._~:-] から外れた文字は拒否される。"
+  (is (= "jp-ashiba.etzhayyim.com" (m/safe-rkey "did:web:jp-ashiba.etzhayyim.com")))
+  (is (= "a-b-c" (m/safe-rkey "a/b c")))
+  (is (= "evil.example-..-..-x" (m/safe-rkey "did:web:evil.example/../../x"))
+      "path 区切りが残ると rkey が階層を作る")
+  (is (= "ok._~-" (m/safe-rkey "ok._~-")) "安全文字は潰さない")
+  (doseq [s ["a/b" "a b" "a?b" "a#b" "a%b"]]
+    (is (nil? (re-find #"[^A-Za-z0-9._~-]" (m/safe-rkey s)))
+        (str (pr-str s) " から不正文字が残った"))))
+
+(deftest safe-rkey-never-returns-blank
+  "空 rkey は『rkey を指定しなかった』と区別が付かない。nil / 空文字 /
+   潰した結果が空になる入力のいずれでも、必ず何か返すこと。"
+  (doseq [s [nil "" "   " "did:web:"]]
+    (is (not (str/blank? (m/safe-rkey s))) (str "blank になった: " (pr-str s)))))
+
+(deftest safe-rkey-does-not-yet-guard-the-reserved-record-keys
+  "**これは『正しい』の固定ではない —— 既知の欠陥の固定である**
+   （docs/identity-claims.edn の :gaps → :rkey/reserved-not-guarded）。
+
+   AT Protocol は record key として `.` と `..` を予約しており、この 2 つは
+   rkey として不正。safe-rkey は不正文字を `-` に潰すが `.` は安全文字なので
+   素通りし、入力が `..` のとき予約語そのものが rkey になる。
+
+   直すときはこの deftest を**書き換える**こと（例: blank 判定と同じ場所で
+   \"unknown\" に落とす）。直すと赤くなるのは意図どおりで、
+   『測定値を更新しろ』という意味である。"
+  (is (= "." (m/safe-rkey ".")))
+  (is (= ".." (m/safe-rkey "..")))
+  (is (= ".." (m/safe-rkey "did:web:.."))))
+
+;; ── 表そのもの ──────────────────────────────────────────────────────────────
+
+(deftest all-cell-plans-covers-every-cell-and-blocks-them-all-when-unattested
+  "`all-cell-plans` は表を 1 件も落とさずに回すこと。cell が増えたのに
+   ここだけ古い列挙を持つ、という形の drift を止める。"
+  (let [plans (m/all-cell-plans {:attestations {}})]
+    (is (= (set (keys m/cell-specs)) (set (keys plans))))
+    (is (every? #(= :blocked (:status %)) (vals plans)))))
