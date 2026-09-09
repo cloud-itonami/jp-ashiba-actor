@@ -21,7 +21,7 @@
 
    どちらも壊れ方が静かなので、fixture で撃って赤くなることを確かめてある
    （`scripts/maturity-loop/mutations.edn` の :jp-ashiba/*）。"
-  (:require [kotoba.lang.text :as str]
+  (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [jp_ashiba.murakumo :as m]))
 

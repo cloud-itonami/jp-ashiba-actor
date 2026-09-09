@@ -7,7 +7,7 @@
    『存在しない URL を測って 404 だと報告する』—— 測定は動いているように
    見えるので、間違いに気づく手がかりが無い。claims の URL は必ずここから
    導出し、突き合わせる。"
-  (:require [kotoba.lang.text :as str]))
+  (:require [clojure.string :as str]))
 
 (defn did->document-url
   "did:web の DID から、DID document が置かれているべき URL を導く。
