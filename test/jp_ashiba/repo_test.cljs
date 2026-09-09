@@ -8,7 +8,7 @@
 
    ここの deftest は原則 **両方向に落ちる**。悪化したときだけでなく、
    直ったときにも赤くなって『測り直して claims を更新しろ』と言う。"
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [cljs.reader :as reader]
             [jp_ashiba.didweb :as didweb]
