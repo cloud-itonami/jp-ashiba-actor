@@ -34,7 +34,7 @@
                  実際に配られたのは did:web:etzhayyim.com:actor:<name> の方だった。"}
 
   {:id          :did/substrate
-   :source      "src/jp_ashiba/murakumo.cljc → actor-did"
+   :source      "src/jp_ashiba/murakumo.cljk → actor-did"
    :did         "did:web:jp-ashiba.etzhayyim.com"
    :resolves-to "https://jp-ashiba.etzhayyim.com/.well-known/did.json"
    :measured    {:http 0}
@@ -153,7 +153,7 @@
  ;; 直したら赤くなる。直すときは test の該当 deftest ごと書き換えること。
  :gaps
  [{:id :rkey/reserved-not-guarded
-   :where "src/jp_ashiba/murakumo.cljc → safe-rkey"
+   :where "src/jp_ashiba/murakumo.cljk → safe-rkey"
    :measured {"." "." ".." ".." "did:web:.." ".."}
    :note "AT Protocol は record key として `.` と `..` を予約しており、この 2 つは
           rkey として不正である。safe-rkey は不正文字を `-` に潰すが、`.` は
@@ -164,7 +164,7 @@
           修正するときは blank 判定と同じ場所で弾くのが素直。"}
 
   {:id :effects/attributed-to-unresolvable-did
-   :where "src/jp_ashiba/murakumo.cljc → actor-did"
+   :where "src/jp_ashiba/murakumo.cljk → actor-did"
    :measured {:did "did:web:jp-ashiba.etzhayyim.com" :http 0}
    :note "gate が発行する effect の :actor と record の :actorDid は、解決しない
           DID を名乗る（:did/substrate 参照）。解決する DID は
