@@ -9,7 +9,7 @@
 ;; deny-by-default の gate（required-gates が揃わなければ effect を出さない）を
 ;; 持つのに、それが緩んでも誰も気づかない状態が既定だった。
 ;;
-;; workspace の規則（superproject CLAUDE.md）で script host は nbb に一本化されて
+;; workspace の規則（superproject AGENTS.md）で script host は nbb に一本化されて
 ;; おり、新規の .ts / .mjs / .sh は禁止。よって runner は nbb + cljs.test である。
 (ns run-tests
   (:require [kotoba.test :as t]
